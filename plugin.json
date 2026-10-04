@@ -1,0 +1,11 @@
+{
+  "name": "mac-local-dictation",
+  "displayName": "Local Voice Dictation (macOS)",
+  "version": "1.0.0",
+  "description": "On-device GPU-accelerated voice dictation for macOS Apple Silicon using mlx-whisper with zero network latency.",
+  "suggestedPrompts": [
+    "Install and configure local voice dictation on this Mac",
+    "Check status and logs of the mac-local-dictation service",
+    "Switch dictation audio mode between instant stream and on-demand privacy"
+  ]
+}
