@@ -79,7 +79,9 @@ Preferences can be switched dynamically in the menu bar dropdown or saved in `~/
 {
   "audio_mode": "stream",
   "hotkey": "cmd_r",
-  "pause_media": true
+  "pause_media": true,
+  "vocabulary": ["Siobhan"],
+  "replacements": {"Shivon": "Siobhan"}
 }
 ```
 

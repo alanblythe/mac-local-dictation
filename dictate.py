@@ -663,6 +663,12 @@ class LocalWhisperApp(rumps.App):
     text = re.sub(pattern_phrase, r'\1', text, flags=re.IGNORECASE)
     return text.strip()
 
+  def _apply_replacements(self, text, replacements):
+    for heard, wanted in replacements.items():
+      pattern = r"\b" + re.escape(heard) + r"\b"
+      text = re.sub(pattern, lambda m: wanted.upper() if m.group(0).isupper() and len(m.group(0)) > 1 else wanted, text, flags=re.IGNORECASE)
+    return text
+
   # ---------------------------------------------------------------------------
   # Dedicated Sequential Transcription Worker Loop
   # ---------------------------------------------------------------------------
@@ -733,6 +739,11 @@ class LocalWhisperApp(rumps.App):
       wav_path = f.name
       wavfile.write(wav_path, SAMPLE_RATE, audio_int16)
 
+    # Read per transcription so vocabulary edits apply without a restart
+    cfg = self._load_config()
+    vocabulary = cfg.get("vocabulary") or []
+    replacements = cfg.get("replacements") or {}
+
     try:
       start_t = time.time()
       res = mlx_whisper.transcribe(
@@ -742,9 +753,11 @@ class LocalWhisperApp(rumps.App):
           condition_on_previous_text=False,
           compression_ratio_threshold=2.0,
           no_speech_threshold=0.6,
+          initial_prompt=", ".join(vocabulary) + "." if vocabulary else None,
       )
       text = res.get("text", "").strip()
       text = self._clean_repetitions(text)
+      text = self._apply_replacements(text, replacements)
       elapsed = time.time() - start_t
       rtf = trimmed_duration / max(elapsed, 0.001)
 
