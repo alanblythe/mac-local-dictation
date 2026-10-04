@@ -91,12 +91,14 @@ Preferences are stored in `~/.dictate_config.json`:
 ```json
 {
   "audio_mode": "stream",
-  "hotkey": "cmd_r"
+  "hotkey": "cmd_r",
+  "pause_media": true
 }
 ```
 
 * `audio_mode`: `"stream"` (0ms latency) or `"on_demand"` (mic privacy).
 * `hotkey`: `"cmd_r"` (Right Command) or `"alt_r"` (Right Option).
+* `pause_media`: pause browser and media-app playback while recording, resume after (default `true`). A browser paused within ~10s before dictating can be resumed.
 
 ---
 

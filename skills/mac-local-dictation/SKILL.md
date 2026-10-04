@@ -78,7 +78,8 @@ Preferences can be switched dynamically in the menu bar dropdown or saved in `~/
 ```json
 {
   "audio_mode": "stream",
-  "hotkey": "cmd_r"
+  "hotkey": "cmd_r",
+  "pause_media": true
 }
 ```
 

@@ -72,9 +72,11 @@ if len(sys.argv) > 2 and sys.argv[1] == "--record-worker":
       wf.writeframes(audio_bytes)
   sys.exit(0)
 
+import ctypes
 import json
 import queue
 import re
+import struct
 import subprocess
 import tempfile
 import threading
@@ -82,6 +84,7 @@ import time
 import mlx.core as mx
 import mlx_whisper
 import numpy as np
+import objc
 import pyperclip
 from pynput import keyboard
 import rumps
@@ -117,6 +120,84 @@ def log(category: str, message: str):
   print(f"[{ts}] [{category}] {message}", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Media Pause While Dictating
+# ---------------------------------------------------------------------------
+# macOS 15.4+ blocks reading Now Playing state, so "playing" means a media
+# app has audio output open. Browsers hold output open ~10s after a pause.
+MEDIA_BUNDLE_PREFIXES = (
+    "com.google.Chrome",
+    "com.apple.Safari",
+    "com.apple.WebKit.GPU",
+    "org.mozilla.firefox",
+    "company.thebrowser.Browser",
+    "com.microsoft.edgemac",
+    "com.brave.Browser",
+    "com.spotify.client",
+    "com.apple.Music",
+    "com.apple.podcasts",
+    "com.apple.TV",
+    "org.videolan.vlc",
+    "com.colliderli.iina",
+)
+MR_COMMAND_PLAY = 0
+MR_COMMAND_PAUSE = 1
+
+
+class _AudioObjectAddress(ctypes.Structure):
+  _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("element", ctypes.c_uint32)]
+
+
+def _fourcc(code):
+  return struct.unpack(">I", code.encode())[0]
+
+
+class MediaController:
+
+  def __init__(self):
+    self._coreaudio = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+    self._mediaremote = ctypes.cdll.LoadLibrary("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote")
+    self._mediaremote.MRMediaRemoteSendCommand.argtypes = [ctypes.c_int, ctypes.c_void_p]
+    self._mediaremote.MRMediaRemoteSendCommand.restype = ctypes.c_bool
+    self.paused_by_us = False
+
+  def _get_property(self, obj_id, selector, ctype):
+    addr = _AudioObjectAddress(_fourcc(selector), _fourcc("glob"), 0)
+    size = ctypes.c_uint32(0)
+    if self._coreaudio.AudioObjectGetPropertyDataSize(obj_id, ctypes.byref(addr), 0, None, ctypes.byref(size)):
+      return []
+    buf = (ctype * (size.value // ctypes.sizeof(ctype)))()
+    if self._coreaudio.AudioObjectGetPropertyData(obj_id, ctypes.byref(addr), 0, None, ctypes.byref(size), buf):
+      return []
+    return list(buf)
+
+  def _bundle_id(self, process_id):
+    ref = self._get_property(process_id, "pbid", ctypes.c_void_p)
+    return str(objc.objc_object(c_void_p=ref[0])) if ref and ref[0] else ""
+
+  def media_playing_apps(self):
+    playing = []
+    for process_id in self._get_property(1, "prs#", ctypes.c_uint32):
+      if self._get_property(process_id, "piro", ctypes.c_uint32)[:1] == [1]:
+        bundle_id = self._bundle_id(process_id)
+        if bundle_id.startswith(MEDIA_BUNDLE_PREFIXES):
+          playing.append(bundle_id)
+    return playing
+
+  def pause(self):
+    playing = self.media_playing_apps()
+    if playing:
+      self._mediaremote.MRMediaRemoteSendCommand(MR_COMMAND_PAUSE, None)
+      self.paused_by_us = True
+      log("MEDIA", f"Paused media ({', '.join(sorted(set(playing)))}).")
+
+  def resume(self):
+    if self.paused_by_us:
+      self.paused_by_us = False
+      self._mediaremote.MRMediaRemoteSendCommand(MR_COMMAND_PLAY, None)
+      log("MEDIA", "Resumed media.")
+
+
 class LocalWhisperApp(rumps.App):
 
   def __init__(self):
@@ -134,6 +215,10 @@ class LocalWhisperApp(rumps.App):
     if self.hotkey_mode not in (HOTKEY_CMD_R, HOTKEY_ALT_R):
       self.hotkey_mode = HOTKEY_CMD_R
     self._apply_hotkey_config()
+
+    self.pause_media = bool(self.config.get("pause_media", True))
+    self.media = MediaController()
+    self.media_queue = queue.Queue()
 
     # In-memory stream state (MODE_STREAM)
     self.sd_stream = None
@@ -161,6 +246,7 @@ class LocalWhisperApp(rumps.App):
     self.menu_mode_ondemand = rumps.MenuItem("Mode: 🔒 On-Demand (Mic Privacy)", callback=self._set_mode_ondemand)
     self.menu_hotkey_cmdr = rumps.MenuItem("Hotkey: ⌘ Right Command (Superwhisper Standard)", callback=self._set_hotkey_cmdr)
     self.menu_hotkey_altr = rumps.MenuItem("Hotkey: ⌥ Right Option", callback=self._set_hotkey_altr)
+    self.menu_pause_media = rumps.MenuItem("⏸ Pause Media While Dictating", callback=self._toggle_pause_media)
     self.menu_clear_cache = rumps.MenuItem("🧹 Clear Metal GPU Cache", callback=self.clear_gpu_cache)
 
     self.menu = [
@@ -174,6 +260,8 @@ class LocalWhisperApp(rumps.App):
         self.menu_hotkey_cmdr,
         self.menu_hotkey_altr,
         rumps.separator,
+        self.menu_pause_media,
+        rumps.separator,
         self.menu_clear_cache,
     ]
     self._update_menu_state()
@@ -186,6 +274,7 @@ class LocalWhisperApp(rumps.App):
     threading.Thread(target=self._event_dispatcher_loop, daemon=True).start()
     threading.Thread(target=self._transcription_worker_loop, daemon=True).start()
     threading.Thread(target=self._watchdog_loop, daemon=True).start()
+    threading.Thread(target=self._media_worker_loop, daemon=True).start()
 
     # Pre-warm Whisper model in background
     threading.Thread(target=self._preload_model, daemon=True).start()
@@ -236,9 +325,10 @@ class LocalWhisperApp(rumps.App):
       cfg = self._load_config()
       cfg["audio_mode"] = self.audio_mode
       cfg["hotkey"] = self.hotkey_mode
+      cfg["pause_media"] = self.pause_media
       with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
-      log("CONFIG", f"Saved preferences: mode={self.audio_mode}, hotkey={self.hotkey_mode}")
+      log("CONFIG", f"Saved preferences: mode={self.audio_mode}, hotkey={self.hotkey_mode}, pause_media={self.pause_media}")
     except Exception as e:
       log("CONFIG", f"Error saving config: {e}")
 
@@ -247,6 +337,7 @@ class LocalWhisperApp(rumps.App):
     self.menu_mode_ondemand.state = 1 if self.audio_mode == MODE_ON_DEMAND else 0
     self.menu_hotkey_cmdr.state = 1 if self.hotkey_mode == HOTKEY_CMD_R else 0
     self.menu_hotkey_altr.state = 1 if self.hotkey_mode == HOTKEY_ALT_R else 0
+    self.menu_pause_media.state = 1 if self.pause_media else 0
     self.menu_toggle.title = f"⏺ Toggle Recording ({self.hotkey_display_name})"
 
   def _set_mode_stream(self, _=None):
@@ -292,6 +383,27 @@ class LocalWhisperApp(rumps.App):
       self._update_menu_state()
       log("HOTKEY", "Switched hotkey to Right Option (alt_r).")
       rumps.notification("Dictate", "Hotkey Changed", "⌥ Right Option is now your dictation key.")
+
+  def _toggle_pause_media(self, _=None):
+    with self.lock:
+      self.pause_media = not self.pause_media
+      self._save_config()
+      self._update_menu_state()
+      log("MEDIA", f"Pause media while dictating: {'on' if self.pause_media else 'off'}.")
+
+  # ---------------------------------------------------------------------------
+  # Media Worker Loop (serializes pause/resume off the hotkey path)
+  # ---------------------------------------------------------------------------
+  def _media_worker_loop(self):
+    while True:
+      action = self.media_queue.get()
+      try:
+        if action == "PAUSE":
+          self.media.pause()
+        elif action == "RESUME":
+          self.media.resume()
+      except Exception as e:
+        log("ERROR", f"Media {action.lower()} failed: {e}")
 
   # ---------------------------------------------------------------------------
   # Persistent In-Memory Stream Backend (MODE_STREAM)
@@ -402,6 +514,8 @@ class LocalWhisperApp(rumps.App):
       self.is_recording = True
       self.recording_start_time = time.time()
       self.title = TITLE_RECORDING
+      if self.pause_media:
+        self.media_queue.put("PAUSE")
 
       if self.audio_mode == MODE_STREAM:
         now = time.time()
@@ -435,6 +549,7 @@ class LocalWhisperApp(rumps.App):
           self.is_recording = False
           self.record_proc = None
           self.title = TITLE_IDLE
+          self.media_queue.put("RESUME")
           if self.current_wav_path and os.path.exists(self.current_wav_path):
             os.remove(self.current_wav_path)
 
@@ -444,6 +559,7 @@ class LocalWhisperApp(rumps.App):
         return
       self.is_recording = False
       self.title = TITLE_BUSY
+      self.media_queue.put("RESUME")
       rec_duration = time.time() - self.recording_start_time if self.recording_start_time else 0
       self.recording_start_time = None
 
