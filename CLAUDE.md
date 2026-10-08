@@ -15,7 +15,7 @@ On-device voice dictation for macOS Apple Silicon using `mlx-whisper` and OpenAI
 * **Inspect Logs:** `tail -n 30 skills/mac-local-dictation/dictate.log`
 
 ### Custom Slash Command
-A native Claude Code slash command is available at [`.claude/commands/dictate.md`](file:///Users/ablythe/repos/personal/mac-local-dictation/.claude/commands/dictate.md). You can run `/dictate` in terminal chat for service operations.
+A native Claude Code slash command is available at [`.claude/commands/dictate.md`](.claude/commands/dictate.md). You can run `/dictate` in terminal chat for service operations.
 
 ---
 

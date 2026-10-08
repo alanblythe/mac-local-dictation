@@ -7,7 +7,7 @@ This repository contains **mac-local-dictation**, a 100% on-device, private voic
 ## 1. Skill Discovery & Execution
 
 * The primary operational runbook and procedure guide is located at:
-  [`skills/mac-local-dictation/SKILL.md`](file:///Users/ablythe/repos/personal/mac-local-dictation/skills/mac-local-dictation/SKILL.md)
+  [`skills/mac-local-dictation/SKILL.md`](skills/mac-local-dictation/SKILL.md)
 * Use the skill whenever the user asks to install, configure, manage, diagnose, or troubleshoot local voice dictation on their Mac.
 
 ---
