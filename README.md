@@ -60,6 +60,8 @@ The installer will:
 If you prefer to configure manually:
 
 ```bash
+cd skills/mac-local-dictation
+
 # 1. Create and activate virtual environment
 python3 -m venv venv
 source venv/bin/activate
