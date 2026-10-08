@@ -28,6 +28,7 @@ if len(sys.argv) > 2 and sys.argv[1] == "--record-worker":
   import sounddevice as sd
 
   out_path = sys.argv[2]
+  device_name = sys.argv[3] if len(sys.argv) > 3 else None
   frames = []
   stop_event = threading.Event()
 
@@ -56,6 +57,7 @@ if len(sys.argv) > 2 and sys.argv[1] == "--record-worker":
         channels=1,
         dtype="int16",
         callback=_audio_cb,
+        device=device_name,
     ):
       while not stop_event.is_set():
         stop_event.wait(0.05)
@@ -107,6 +109,24 @@ MODE_ON_DEMAND = "on_demand"
 HOTKEY_CMD_R = "cmd_r"
 HOTKEY_ALT_R = "alt_r"
 
+MAX_RECORDING_SECONDS = 120
+
+# Whisper invents these from near-silence; only trusted on clips longer than HALLUCINATION_MAX_SECONDS
+MIN_SPEECH_SECONDS = 0.3
+HALLUCINATION_MAX_SECONDS = 2.0
+SILENCE_HALLUCINATIONS = {
+    "you", "thank you", "thanks", "thank you very much", "thanks for watching",
+    "thank you for watching", "bye", "gracias", "okay", "so",
+}
+# Another key pressed within this window of the hotkey means a shortcut, not dictation
+CHORD_CANCEL_SECONDS = 1.0
+
+STREAM_CHECK_SECONDS = 5
+STREAM_STALL_SECONDS = 3.0
+STREAM_HEALTHY_SECONDS = 10
+STREAM_RETRY_MAX_SECONDS = 60
+STREAM_CLOSE_TIMEOUT_SECONDS = 2.0
+
 
 def clear_mlx_cache():
   if hasattr(mx, "clear_cache"):
@@ -118,6 +138,64 @@ def clear_mlx_cache():
 def log(category: str, message: str):
   ts = time.strftime("%Y-%m-%d %H:%M:%S")
   print(f"[{ts}] [{category}] {message}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# CoreAudio Queries
+# ---------------------------------------------------------------------------
+_COREAUDIO = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+AUDIO_SYSTEM_OBJECT = 1
+
+
+class _AudioObjectAddress(ctypes.Structure):
+  _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("element", ctypes.c_uint32)]
+
+
+def _fourcc(code):
+  return struct.unpack(">I", code.encode())[0]
+
+
+def coreaudio_property(obj_id, selector, ctype, scope="glob"):
+  addr = _AudioObjectAddress(_fourcc(selector), _fourcc(scope), 0)
+  size = ctypes.c_uint32(0)
+  if _COREAUDIO.AudioObjectGetPropertyDataSize(obj_id, ctypes.byref(addr), 0, None, ctypes.byref(size)):
+    return []
+  buf = (ctype * (size.value // ctypes.sizeof(ctype)))()
+  if _COREAUDIO.AudioObjectGetPropertyData(obj_id, ctypes.byref(addr), 0, None, ctypes.byref(size), buf):
+    return []
+  return list(buf)
+
+
+def coreaudio_string(obj_id, selector):
+  ref = coreaudio_property(obj_id, selector, ctypes.c_void_p)
+  return str(objc.objc_object(c_void_p=ref[0])) if ref and ref[0] else ""
+
+
+def input_devices():
+  """Returns {name: device_id} for connected devices that have input streams."""
+  devices = {}
+  for device_id in coreaudio_property(AUDIO_SYSTEM_OBJECT, "dev#", ctypes.c_uint32):
+    if coreaudio_property(device_id, "stm#", ctypes.c_uint32, scope="inpt"):
+      devices[coreaudio_string(device_id, "lnam")] = device_id
+  return devices
+
+
+def choose_input_device(preferred_names):
+  """First connected device from preferred_names (case-insensitive), else the macOS default."""
+  if preferred_names:
+    available = {name.lower(): (device_id, name) for name, device_id in input_devices().items()}
+    for wanted in preferred_names:
+      if wanted.lower() in available:
+        return available[wanted.lower()]
+  return default_input_device()
+
+
+def default_input_device():
+  """Returns (device_id, name) of the macOS default input, read live."""
+  ids = coreaudio_property(AUDIO_SYSTEM_OBJECT, "dIn ", ctypes.c_uint32)
+  if not ids:
+    return None, ""
+  return ids[0], coreaudio_string(ids[0], "lnam")
 
 
 # ---------------------------------------------------------------------------
@@ -144,42 +222,19 @@ MR_COMMAND_PLAY = 0
 MR_COMMAND_PAUSE = 1
 
 
-class _AudioObjectAddress(ctypes.Structure):
-  _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("element", ctypes.c_uint32)]
-
-
-def _fourcc(code):
-  return struct.unpack(">I", code.encode())[0]
-
-
 class MediaController:
 
   def __init__(self):
-    self._coreaudio = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
     self._mediaremote = ctypes.cdll.LoadLibrary("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote")
     self._mediaremote.MRMediaRemoteSendCommand.argtypes = [ctypes.c_int, ctypes.c_void_p]
     self._mediaremote.MRMediaRemoteSendCommand.restype = ctypes.c_bool
     self.paused_by_us = False
 
-  def _get_property(self, obj_id, selector, ctype):
-    addr = _AudioObjectAddress(_fourcc(selector), _fourcc("glob"), 0)
-    size = ctypes.c_uint32(0)
-    if self._coreaudio.AudioObjectGetPropertyDataSize(obj_id, ctypes.byref(addr), 0, None, ctypes.byref(size)):
-      return []
-    buf = (ctype * (size.value // ctypes.sizeof(ctype)))()
-    if self._coreaudio.AudioObjectGetPropertyData(obj_id, ctypes.byref(addr), 0, None, ctypes.byref(size), buf):
-      return []
-    return list(buf)
-
-  def _bundle_id(self, process_id):
-    ref = self._get_property(process_id, "pbid", ctypes.c_void_p)
-    return str(objc.objc_object(c_void_p=ref[0])) if ref and ref[0] else ""
-
   def media_playing_apps(self):
     playing = []
-    for process_id in self._get_property(1, "prs#", ctypes.c_uint32):
-      if self._get_property(process_id, "piro", ctypes.c_uint32)[:1] == [1]:
-        bundle_id = self._bundle_id(process_id)
+    for process_id in coreaudio_property(AUDIO_SYSTEM_OBJECT, "prs#", ctypes.c_uint32):
+      if coreaudio_property(process_id, "piro", ctypes.c_uint32)[:1] == [1]:
+        bundle_id = coreaudio_string(process_id, "pbid")
         if bundle_id.startswith(MEDIA_BUNDLE_PREFIXES):
           playing.append(bundle_id)
     return playing
@@ -222,6 +277,11 @@ class LocalWhisperApp(rumps.App):
 
     # In-memory stream state (MODE_STREAM)
     self.sd_stream = None
+    self.stream_lock = threading.RLock()
+    self.stream_device_id = None
+    self.stream_opened_at = 0.0
+    self.stream_failures = 0
+    self.next_stream_retry = 0.0
     self.stream_frames = []
 
     # On-demand process state (MODE_ON_DEMAND)
@@ -233,6 +293,9 @@ class LocalWhisperApp(rumps.App):
     self.transcribe_queue = queue.Queue()
 
     self.key_press_time = None
+    self.trigger_down = False
+    self.press_started_recording = False
+    self.pasting = False
     self.recording_start_time = None
     self.transcription_start_time = None
     self.last_audio_tick = 0.0
@@ -416,28 +479,57 @@ class LocalWhisperApp(rumps.App):
       self.stream_frames.append(indata.copy())
 
   def _start_persistent_stream(self):
-    try:
-      if self.sd_stream is None:
-        self.sd_stream = sd.InputStream(
+    with self.stream_lock:
+      if self.sd_stream is not None:
+        return
+      device_id, device_name = self._target_input_device()
+      try:
+        # PortAudio caches the device list at init; rescan so newly connected devices are visible
+        sd._terminate()
+        sd._initialize()
+        stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=1,
             dtype="float32",
             callback=self._sd_audio_callback,
             blocksize=1024,
+            device=device_name or None,
         )
-        self.sd_stream.start()
+        stream.start()
+        self.sd_stream = stream
+        self.stream_device_id = device_id
+        self.stream_opened_at = time.time()
         self.last_audio_tick = time.time()
-        log("AUDIO", "Persistent in-memory audio stream initialized (0ms latency ready).")
-    except Exception as e:
-      log("ERROR", f"Failed to initialize in-memory audio stream: {e}")
-      self.sd_stream = None
+        log("AUDIO", f"Audio stream open on '{device_name}' (0ms latency ready).")
+      except Exception as e:
+        self._schedule_stream_retry(f"Failed to open audio stream on '{device_name}': {e}")
 
-  def _recreate_stream(self):
-    old_stream = self.sd_stream
-    self.sd_stream = None
-    if old_stream is not None:
-      threading.Thread(target=self._safe_close_stream, args=(old_stream,), daemon=True).start()
-    self._start_persistent_stream()
+  def _target_input_device(self):
+    # Read per check so input_devices edits apply without a restart
+    return choose_input_device(self._load_config().get("input_devices") or [])
+
+  def _schedule_stream_retry(self, reason):
+    self.stream_failures += 1
+    delay = min(STREAM_RETRY_MAX_SECONDS, 2 ** self.stream_failures)
+    self.next_stream_retry = time.time() + delay
+    log("WARN", f"{reason} Retrying in {delay}s.")
+
+  def _close_stream(self, stream_obj):
+    """Closes synchronously so PortAudio can be reinitialized; False if the close hangs."""
+    closer = threading.Thread(target=self._safe_close_stream, args=(stream_obj,), daemon=True)
+    closer.start()
+    closer.join(STREAM_CLOSE_TIMEOUT_SECONDS)
+    return not closer.is_alive()
+
+  def _recreate_stream(self, reason):
+    with self.stream_lock:
+      log("AUDIO", f"Rebuilding audio stream: {reason}.")
+      old_stream = self.sd_stream
+      self.sd_stream = None
+      if old_stream is not None and not self._close_stream(old_stream):
+        self._schedule_stream_retry("Old audio stream did not close.")
+        return
+      self._start_persistent_stream()
 
   def _safe_close_stream(self, stream_obj):
     try:
@@ -448,21 +540,46 @@ class LocalWhisperApp(rumps.App):
       log("WARN", f"Exception closing audio stream: {e}")
 
   def _stop_persistent_stream(self):
-    if self.sd_stream is not None:
-      stream = self.sd_stream
-      self.sd_stream = None
-      threading.Thread(target=self._safe_close_stream, args=(stream,), daemon=True).start()
+    with self.stream_lock:
+      if self.sd_stream is not None:
+        stream = self.sd_stream
+        self.sd_stream = None
+        self._close_stream(stream)
 
+  def _check_stream_health(self):
+    if self.is_recording or time.time() < self.next_stream_retry:
+      return
+    with self.stream_lock:
+      if self.sd_stream is None:
+        self._start_persistent_stream()
+        return
+      device_id, device_name = self._target_input_device()
+      stalled = not self.sd_stream.active or (time.time() - self.last_audio_tick > STREAM_STALL_SECONDS)
+      if device_id != self.stream_device_id:
+        self.stream_failures = 0
+        self._recreate_stream(f"input device changed to '{device_name}'")
+      elif stalled:
+        if time.time() - self.stream_opened_at < STREAM_HEALTHY_SECONDS:
+          self._stop_persistent_stream()
+          self._schedule_stream_retry(f"Audio stream on '{device_name}' stalled right after opening.")
+        else:
+          self._recreate_stream("stream stalled")
+      elif time.time() - self.stream_opened_at >= STREAM_HEALTHY_SECONDS:
+        self.stream_failures = 0
 
   # ---------------------------------------------------------------------------
   # Hotkey Event Tap Callbacks (Ultra-lightweight: strictly non-blocking)
   # ---------------------------------------------------------------------------
   def _on_key_press(self, key):
     if key == self.trigger_key:
+      self.trigger_down = True
       self.event_queue.put(("KEY_PRESS", time.time()))
+    elif self.trigger_down and not self.pasting:
+      self.event_queue.put(("CHORD", time.time()))
 
   def _on_key_release(self, key):
     if key == self.trigger_key:
+      self.trigger_down = False
       self.event_queue.put(("KEY_RELEASE", time.time()))
 
   # ---------------------------------------------------------------------------
@@ -475,6 +592,7 @@ class LocalWhisperApp(rumps.App):
         if event_type == "KEY_PRESS":
           if self.key_press_time is None:
             self.key_press_time = ts
+            self.press_started_recording = not self.is_recording
             if not self.is_recording:
               log("HOTKEY", f"{self.hotkey_display_name} pressed -> starting recording...")
               self._start_recording()
@@ -486,12 +604,19 @@ class LocalWhisperApp(rumps.App):
           if self.key_press_time is not None:
             duration = ts - self.key_press_time
             self.key_press_time = None
+            self.press_started_recording = False
             # If held for >= 0.25s (push-to-talk mode), stop on release
             if duration >= 0.25 and self.is_recording:
               log("HOTKEY", f"{self.hotkey_display_name} released after {duration:.2f}s -> stopping push-to-talk...")
               self._stop_and_enqueue_transcription()
             elif self.is_recording:
               log("HOTKEY", f"Quick tap ({duration:.2f}s) -> hands-free recording active.")
+
+        elif event_type == "CHORD":
+          if self.press_started_recording and ts - self.key_press_time <= CHORD_CANCEL_SECONDS:
+            self.press_started_recording = False
+            log("HOTKEY", f"{self.hotkey_display_name} used in a shortcut -> recording discarded.")
+            self._cancel_recording()
 
         elif event_type == "TOGGLE_MENU":
           if not self.is_recording:
@@ -518,10 +643,11 @@ class LocalWhisperApp(rumps.App):
         self.media_queue.put("PAUSE")
 
       if self.audio_mode == MODE_STREAM:
-        now = time.time()
-        if self.sd_stream is None or not self.sd_stream.active or (now - self.last_audio_tick > 1.5):
-          log("AUDIO", "Persistent stream was dead/stalled. Rebuilding stream...")
-          self._recreate_stream()
+        device_id, device_name = self._target_input_device()
+        if self.sd_stream is None or not self.sd_stream.active or (time.time() - self.last_audio_tick > 1.5):
+          self._recreate_stream("stream dead or stalled at recording start")
+        elif device_id != self.stream_device_id:
+          self._recreate_stream(f"input device changed to '{device_name}'")
         self.stream_frames = []
         log("AUDIO", "Instant stream recording active (0ms start).")
 
@@ -536,6 +662,9 @@ class LocalWhisperApp(rumps.App):
             "--record-worker",
             self.current_wav_path,
         ]
+        _, device_name = self._target_input_device()
+        if device_name:
+          cmd.append(device_name)
         try:
           self.record_proc = subprocess.Popen(
               cmd,
@@ -553,6 +682,24 @@ class LocalWhisperApp(rumps.App):
           if self.current_wav_path and os.path.exists(self.current_wav_path):
             os.remove(self.current_wav_path)
 
+  def _cancel_recording(self):
+    with self.lock:
+      if not self.is_recording:
+        return
+      self.is_recording = False
+      self.recording_start_time = None
+      self.title = TITLE_IDLE
+      self.stream_frames = []
+      self.media_queue.put("RESUME")
+      proc, wav_path = self.record_proc, self.current_wav_path
+      self.record_proc = None
+      self.current_wav_path = None
+    if proc is not None:
+      proc.kill()
+      proc.wait()
+    if wav_path and os.path.exists(wav_path):
+      os.remove(wav_path)
+
   def _stop_and_enqueue_transcription(self):
     with self.lock:
       if not self.is_recording:
@@ -567,8 +714,7 @@ class LocalWhisperApp(rumps.App):
         captured_frames = list(self.stream_frames)
         self.stream_frames = []
         if not captured_frames and rec_duration > 0.2:
-          log("WARN", f"No frames captured during {rec_duration:.2f}s recording. Stream stalled, reviving...")
-          self._recreate_stream()
+          self._recreate_stream(f"no frames captured during {rec_duration:.2f}s recording")
         self.transcription_start_time = time.time()
         self.transcribe_queue.put(("MEMORY", captured_frames, rec_duration))
 
@@ -663,6 +809,11 @@ class LocalWhisperApp(rumps.App):
     text = re.sub(pattern_phrase, r'\1', text, flags=re.IGNORECASE)
     return text.strip()
 
+  def _is_silence_hallucination(self, text, vocabulary):
+    normalized = re.sub(r"[^\w\s]", "", text).strip().lower()
+    vocab_echo = re.sub(r"[^\w\s]", "", " ".join(vocabulary)).strip().lower()
+    return normalized in SILENCE_HALLUCINATIONS or (vocab_echo and normalized == vocab_echo)
+
   def _apply_replacements(self, text, replacements):
     for heard, wanted in replacements.items():
       pattern = r"\b" + re.escape(heard) + r"\b"
@@ -732,6 +883,10 @@ class LocalWhisperApp(rumps.App):
     trimmed_duration = len(audio) / SAMPLE_RATE
     peak_rms = np.sqrt(np.mean(audio**2))
 
+    if trimmed_duration < MIN_SPEECH_SECONDS:
+      log("WHISPER", f"Clip too short to contain speech ({trimmed_duration:.2f}s). Skipped.")
+      return
+
     log("WHISPER", f"Transcribing audio: raw={raw_duration:.2f}s, trimmed={trimmed_duration:.2f}s, rms={peak_rms:.4f}")
 
     audio_int16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
@@ -756,6 +911,9 @@ class LocalWhisperApp(rumps.App):
           initial_prompt=", ".join(vocabulary) + "." if vocabulary else None,
       )
       text = res.get("text", "").strip()
+      if trimmed_duration < HALLUCINATION_MAX_SECONDS and self._is_silence_hallucination(text, vocabulary):
+        log("WHISPER", f"Dropped likely hallucination on {trimmed_duration:.2f}s clip: \"{text}\"")
+        return
       text = self._clean_repetitions(text)
       text = self._apply_replacements(text, replacements)
       elapsed = time.time() - start_t
@@ -776,6 +934,8 @@ class LocalWhisperApp(rumps.App):
   # Auto-Paste Simulation
   # ---------------------------------------------------------------------------
   def _paste(self):
+    # The listener sees these synthetic keys; keep them from reading as a hotkey shortcut
+    self.pasting = True
     try:
       self.keyboard_controller.press(keyboard.Key.cmd)
       self.keyboard_controller.press('v')
@@ -792,13 +952,17 @@ class LocalWhisperApp(rumps.App):
         log("PASTE", "Pasted via osascript.")
       except Exception as ex:
         log("ERROR", f"Auto-paste failed: {ex}")
+    finally:
+      time.sleep(0.1)
+      self.pasting = False
 
   # ---------------------------------------------------------------------------
   # Watchdog Loop (Self-healing for hung states)
   # ---------------------------------------------------------------------------
   def _watchdog_loop(self):
+    last_stream_check = 0.0
     while True:
-      time.sleep(5)
+      time.sleep(1)
       now = time.time()
 
       # Check for hung transcription (> 45s)
@@ -807,16 +971,13 @@ class LocalWhisperApp(rumps.App):
         self.transcription_start_time = None
         self.title = TITLE_IDLE
 
-      # Check for orphaned recording stream (> 15 minutes)
-      if self.is_recording and self.recording_start_time and (now - self.recording_start_time > 900):
-        log("WATCHDOG", "Recording exceeded 15 minutes max timeout. Auto-stopping.")
+      if self.is_recording and self.recording_start_time and (now - self.recording_start_time > MAX_RECORDING_SECONDS):
+        log("WATCHDOG", f"Recording hit the {MAX_RECORDING_SECONDS}s cap. Auto-stopping.")
         self._stop_and_enqueue_transcription()
 
-      # Monitor persistent in-memory stream health when idle
-      if self.audio_mode == MODE_STREAM and not self.is_recording:
-        if self.sd_stream is None or not self.sd_stream.active or (now - self.last_audio_tick > 3.0):
-          log("WATCHDOG", "Audio stream stalled or inactive (e.g. device change/sleep). Auto-reviving...")
-          self._recreate_stream()
+      if self.audio_mode == MODE_STREAM and now - last_stream_check >= STREAM_CHECK_SECONDS:
+        last_stream_check = now
+        self._check_stream_health()
 
 
 if __name__ == "__main__":

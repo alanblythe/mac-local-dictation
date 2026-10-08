@@ -81,7 +81,8 @@ Preferences can be switched dynamically in the menu bar dropdown or saved in `~/
   "hotkey": "cmd_r",
   "pause_media": true,
   "vocabulary": ["Siobhan"],
-  "replacements": {"Shivon": "Siobhan"}
+  "replacements": {"Shivon": "Siobhan"},
+  "input_devices": ["My USB Mic", "MacBook Pro Microphone"]
 }
 ```
 

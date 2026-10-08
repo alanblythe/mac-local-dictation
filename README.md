@@ -96,7 +96,8 @@ Preferences are stored in `~/.dictate_config.json`:
   "hotkey": "cmd_r",
   "pause_media": true,
   "vocabulary": ["Siobhan"],
-  "replacements": {"Shivon": "Siobhan"}
+  "replacements": {"Shivon": "Siobhan"},
+  "input_devices": ["My USB Mic", "MacBook Pro Microphone"]
 }
 ```
 
@@ -105,8 +106,9 @@ Preferences are stored in `~/.dictate_config.json`:
 * `pause_media`: pause browser and media-app playback while recording, resume after (default `true`). A browser paused within ~10s before dictating can be resumed.
 * `vocabulary`: names and terms passed to Whisper as a spelling hint.
 * `replacements`: whole-word, case-insensitive swaps applied after transcription (`{"heard": "wanted"}`).
+* `input_devices`: preferred microphones by name; the first connected one is used, else the macOS default. Re-plugging a listed mic switches back to it within ~5s.
 
-Vocabulary and replacements are read on every transcription, so edits apply without a restart.
+Vocabulary, replacements and input devices are read on every transcription, so edits apply without a restart.
 
 ---
 
