@@ -4,7 +4,7 @@ Local Voice Dictation for Apple Silicon macOS using mlx-whisper.
 100% on-device, zero remote network calls.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import os
 import sys
@@ -90,6 +90,13 @@ import objc
 import pyperclip
 from pynput import keyboard
 import rumps
+from AppKit import (
+    NSBackingStoreBuffered, NSColor, NSEvent, NSFont, NSLineBreakByWordWrapping, NSMakeRect, NSPanel,
+    NSScreen, NSStatusWindowLevel, NSTextField, NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowCollectionBehaviorFullScreenAuxiliary, NSWindowStyleMaskBorderless,
+    NSWindowStyleMaskNonactivatingPanel,
+)
+from PyObjCTools import AppHelper
 from scipy.io import wavfile
 import sounddevice as sd
 
@@ -109,7 +116,15 @@ MODE_ON_DEMAND = "on_demand"
 HOTKEY_CMD_R = "cmd_r"
 HOTKEY_ALT_R = "alt_r"
 
-MAX_RECORDING_SECONDS = 120
+MAX_RECORDING_SECONDS = 300
+# A full-length recording takes roughly 20s to transcribe
+TRANSCRIPTION_HUNG_SECONDS = 90
+
+# Live preview: re-transcribe the tail of the recording while the hotkey is held
+PREVIEW_INTERVAL_SECONDS = 1.0
+PREVIEW_WINDOW_SECONDS = 30
+PREVIEW_MIN_SECONDS = 0.6
+PREVIEW_MAX_CHARS = 260
 
 # Whisper invents these from near-silence; only trusted on clips longer than HALLUCINATION_MAX_SECONDS
 MIN_SPEECH_SECONDS = 0.3
@@ -253,6 +268,84 @@ class MediaController:
       log("MEDIA", "Resumed media.")
 
 
+class PreviewOverlay:
+  """Floating, click-through panel showing the live transcript. Never takes focus, so paste lands in the user's app."""
+
+  WIDTH, HEIGHT, MARGIN = 680, 112, 120
+
+  def __init__(self):
+    self.panel = None
+    self.label = None
+
+  def show(self, text):
+    AppHelper.callAfter(self._show, text)
+
+  def hide(self):
+    AppHelper.callAfter(self._hide)
+
+  def _build(self):
+    panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+        NSMakeRect(0, 0, self.WIDTH, self.HEIGHT),
+        NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
+        NSBackingStoreBuffered,
+        False,
+    )
+    panel.setLevel_(NSStatusWindowLevel)
+    panel.setOpaque_(False)
+    panel.setBackgroundColor_(NSColor.clearColor())
+    panel.setIgnoresMouseEvents_(True)
+    panel.setHasShadow_(True)
+    panel.setCollectionBehavior_(
+        NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary
+    )
+    content = panel.contentView()
+    content.setWantsLayer_(True)
+    content.layer().setCornerRadius_(14)
+    content.layer().setBackgroundColor_(NSColor.colorWithWhite_alpha_(0.08, 0.9).CGColor())
+
+    label = NSTextField.alloc().initWithFrame_(NSMakeRect(18, 12, self.WIDTH - 36, self.HEIGHT - 24))
+    label.setEditable_(False)
+    label.setSelectable_(False)
+    label.setBordered_(False)
+    label.setDrawsBackground_(False)
+    label.setTextColor_(NSColor.whiteColor())
+    label.setFont_(NSFont.systemFontOfSize_(15))
+    label.setMaximumNumberOfLines_(4)
+    label.cell().setWraps_(True)
+    label.cell().setLineBreakMode_(NSLineBreakByWordWrapping)
+    content.addSubview_(label)
+    self.panel, self.label = panel, label
+
+  def _show(self, text):
+    if self.panel is None:
+      self._build()
+    self.label.setStringValue_(text)
+    mouse = NSEvent.mouseLocation()
+    screen = next((s for s in NSScreen.screens() if self._contains(s.frame(), mouse)), NSScreen.mainScreen())
+    area = screen.visibleFrame()
+    x = area.origin.x + (area.size.width - self.WIDTH) / 2
+    y = area.origin.y + self.MARGIN
+    self.panel.setFrameOrigin_((x, y))
+    self.panel.orderFrontRegardless()
+
+  def _hide(self):
+    if self.panel is not None:
+      self.panel.orderOut_(None)
+
+  @staticmethod
+  def _contains(frame, point):
+    return (frame.origin.x <= point.x <= frame.origin.x + frame.size.width
+            and frame.origin.y <= point.y <= frame.origin.y + frame.size.height)
+
+
+def preview_tail(text):
+  """Last PREVIEW_MAX_CHARS of text, cut at a word boundary."""
+  if len(text) <= PREVIEW_MAX_CHARS:
+    return text
+  tail = text[-PREVIEW_MAX_CHARS:]
+  return "…" + tail[tail.find(" ") + 1:]
+
+
 class LocalWhisperApp(rumps.App):
 
   def __init__(self):
@@ -272,6 +365,10 @@ class LocalWhisperApp(rumps.App):
     self._apply_hotkey_config()
 
     self.pause_media = bool(self.config.get("pause_media", True))
+    self.show_preview = bool(self.config.get("show_preview", True))
+    self.overlay = PreviewOverlay()
+    # Serialises GPU use between the live preview and the final transcription
+    self.whisper_lock = threading.Lock()
     self.media = MediaController()
     self.media_queue = queue.Queue()
 
@@ -310,6 +407,7 @@ class LocalWhisperApp(rumps.App):
     self.menu_hotkey_cmdr = rumps.MenuItem("Hotkey: ⌘ Right Command (Superwhisper Standard)", callback=self._set_hotkey_cmdr)
     self.menu_hotkey_altr = rumps.MenuItem("Hotkey: ⌥ Right Option", callback=self._set_hotkey_altr)
     self.menu_pause_media = rumps.MenuItem("⏸ Pause Media While Dictating", callback=self._toggle_pause_media)
+    self.menu_show_preview = rumps.MenuItem("👁 Show Live Transcript While Holding", callback=self._toggle_show_preview)
     self.menu_clear_cache = rumps.MenuItem("🧹 Clear Metal GPU Cache", callback=self.clear_gpu_cache)
 
     self.menu = [
@@ -324,6 +422,7 @@ class LocalWhisperApp(rumps.App):
         self.menu_hotkey_altr,
         rumps.separator,
         self.menu_pause_media,
+        self.menu_show_preview,
         rumps.separator,
         self.menu_clear_cache,
     ]
@@ -338,6 +437,7 @@ class LocalWhisperApp(rumps.App):
     threading.Thread(target=self._transcription_worker_loop, daemon=True).start()
     threading.Thread(target=self._watchdog_loop, daemon=True).start()
     threading.Thread(target=self._media_worker_loop, daemon=True).start()
+    threading.Thread(target=self._preview_worker_loop, daemon=True).start()
 
     # Pre-warm Whisper model in background
     threading.Thread(target=self._preload_model, daemon=True).start()
@@ -389,6 +489,7 @@ class LocalWhisperApp(rumps.App):
       cfg["audio_mode"] = self.audio_mode
       cfg["hotkey"] = self.hotkey_mode
       cfg["pause_media"] = self.pause_media
+      cfg["show_preview"] = self.show_preview
       with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
       log("CONFIG", f"Saved preferences: mode={self.audio_mode}, hotkey={self.hotkey_mode}, pause_media={self.pause_media}")
@@ -401,6 +502,7 @@ class LocalWhisperApp(rumps.App):
     self.menu_hotkey_cmdr.state = 1 if self.hotkey_mode == HOTKEY_CMD_R else 0
     self.menu_hotkey_altr.state = 1 if self.hotkey_mode == HOTKEY_ALT_R else 0
     self.menu_pause_media.state = 1 if self.pause_media else 0
+    self.menu_show_preview.state = 1 if self.show_preview else 0
     self.menu_toggle.title = f"⏺ Toggle Recording ({self.hotkey_display_name})"
 
   def _set_mode_stream(self, _=None):
@@ -453,6 +555,53 @@ class LocalWhisperApp(rumps.App):
       self._save_config()
       self._update_menu_state()
       log("MEDIA", f"Pause media while dictating: {'on' if self.pause_media else 'off'}.")
+
+  def _toggle_show_preview(self, _=None):
+    with self.lock:
+      self.show_preview = not self.show_preview
+      self._save_config()
+      self._update_menu_state()
+      log("PREVIEW", f"Live transcript while holding: {'on' if self.show_preview else 'off'}.")
+
+  # ---------------------------------------------------------------------------
+  # Live Preview Worker (re-transcribes the recording's tail while held)
+  # ---------------------------------------------------------------------------
+  def _preview_worker_loop(self):
+    while True:
+      time.sleep(PREVIEW_INTERVAL_SECONDS)
+      # On-demand audio lives in a child process, so only stream mode can preview
+      if not (self.is_recording and self.show_preview and self.audio_mode == MODE_STREAM):
+        continue
+      frames = list(self.stream_frames)
+      if not frames:
+        continue
+      audio = np.concatenate(frames, axis=0).flatten()
+      if len(audio) < PREVIEW_MIN_SECONDS * SAMPLE_RATE:
+        continue
+      clipped = len(audio) > PREVIEW_WINDOW_SECONDS * SAMPLE_RATE
+      audio = audio[-PREVIEW_WINDOW_SECONDS * SAMPLE_RATE:]
+      vocabulary = self._load_config().get("vocabulary") or []
+      # Skip rather than queue behind a final transcription
+      if not self.whisper_lock.acquire(blocking=False):
+        continue
+      try:
+        res = mlx_whisper.transcribe(
+            audio.astype(np.float32),
+            path_or_hf_repo=MODEL_NAME,
+            verbose=None,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.6,
+            initial_prompt=", ".join(vocabulary) + "." if vocabulary else None,
+        )
+        text = self._clean_repetitions(res.get("text", "").strip())
+      except Exception as e:
+        log("PREVIEW", f"Preview transcription failed: {e}")
+        continue
+      finally:
+        self.whisper_lock.release()
+      if self.is_recording and text and not self._is_silence_hallucination(text, vocabulary):
+        self.overlay.show(preview_tail(("…" if clipped else "") + text))
 
   # ---------------------------------------------------------------------------
   # Media Worker Loop (serializes pause/resume off the hotkey path)
@@ -639,6 +788,8 @@ class LocalWhisperApp(rumps.App):
       self.is_recording = True
       self.recording_start_time = time.time()
       self.title = TITLE_RECORDING
+      if self.show_preview:
+        self.overlay.show("Listening…")
       if self.pause_media:
         self.media_queue.put("PAUSE")
 
@@ -678,6 +829,7 @@ class LocalWhisperApp(rumps.App):
           self.is_recording = False
           self.record_proc = None
           self.title = TITLE_IDLE
+          self.overlay.hide()
           self.media_queue.put("RESUME")
           if self.current_wav_path and os.path.exists(self.current_wav_path):
             os.remove(self.current_wav_path)
@@ -689,6 +841,7 @@ class LocalWhisperApp(rumps.App):
       self.is_recording = False
       self.recording_start_time = None
       self.title = TITLE_IDLE
+      self.overlay.hide()
       self.stream_frames = []
       self.media_queue.put("RESUME")
       proc, wav_path = self.record_proc, self.current_wav_path
@@ -706,6 +859,8 @@ class LocalWhisperApp(rumps.App):
         return
       self.is_recording = False
       self.title = TITLE_BUSY
+      if self.show_preview:
+        self.overlay.show("Transcribing…")
       self.media_queue.put("RESUME")
       rec_duration = time.time() - self.recording_start_time if self.recording_start_time else 0
       self.recording_start_time = None
@@ -760,7 +915,8 @@ class LocalWhisperApp(rumps.App):
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
       wavfile.write(f.name, SAMPLE_RATE, dummy)
       try:
-        mlx_whisper.transcribe(f.name, path_or_hf_repo=MODEL_NAME)
+        with self.whisper_lock:
+          mlx_whisper.transcribe(f.name, path_or_hf_repo=MODEL_NAME)
       finally:
         if os.path.exists(f.name):
           os.remove(f.name)
@@ -865,6 +1021,7 @@ class LocalWhisperApp(rumps.App):
       finally:
         self.transcription_start_time = None
         self.title = TITLE_IDLE
+        self.overlay.hide()
         clear_mlx_cache()
         if temp_wav_to_clean and os.path.exists(temp_wav_to_clean):
           try:
@@ -901,15 +1058,16 @@ class LocalWhisperApp(rumps.App):
 
     try:
       start_t = time.time()
-      res = mlx_whisper.transcribe(
-          wav_path,
-          path_or_hf_repo=MODEL_NAME,
-          verbose=False,
-          condition_on_previous_text=False,
-          compression_ratio_threshold=2.0,
-          no_speech_threshold=0.6,
-          initial_prompt=", ".join(vocabulary) + "." if vocabulary else None,
-      )
+      with self.whisper_lock:
+        res = mlx_whisper.transcribe(
+            wav_path,
+            path_or_hf_repo=MODEL_NAME,
+            verbose=False,
+            condition_on_previous_text=False,
+            compression_ratio_threshold=2.0,
+            no_speech_threshold=0.6,
+            initial_prompt=", ".join(vocabulary) + "." if vocabulary else None,
+        )
       text = res.get("text", "").strip()
       if trimmed_duration < HALLUCINATION_MAX_SECONDS and self._is_silence_hallucination(text, vocabulary):
         log("WHISPER", f"Dropped likely hallucination on {trimmed_duration:.2f}s clip: \"{text}\"")
@@ -965,11 +1123,11 @@ class LocalWhisperApp(rumps.App):
       time.sleep(1)
       now = time.time()
 
-      # Check for hung transcription (> 45s)
-      if self.transcription_start_time and (now - self.transcription_start_time > 45):
+      if self.transcription_start_time and (now - self.transcription_start_time > TRANSCRIPTION_HUNG_SECONDS):
         log("WATCHDOG", f"Transcription active for {now - self.transcription_start_time:.1f}s. Resetting status title.")
         self.transcription_start_time = None
         self.title = TITLE_IDLE
+        self.overlay.hide()
 
       if self.is_recording and self.recording_start_time and (now - self.recording_start_time > MAX_RECORDING_SECONDS):
         log("WATCHDOG", f"Recording hit the {MAX_RECORDING_SECONDS}s cap. Auto-stopping.")

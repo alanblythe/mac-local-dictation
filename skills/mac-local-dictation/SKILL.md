@@ -80,11 +80,14 @@ Preferences can be switched dynamically in the menu bar dropdown or saved in `~/
   "audio_mode": "stream",
   "hotkey": "cmd_r",
   "pause_media": true,
+  "show_preview": true,
   "vocabulary": ["Siobhan"],
   "replacements": {"Shivon": "Siobhan"},
   "input_devices": ["My USB Mic", "MacBook Pro Microphone"]
 }
 ```
+
+`show_preview` shows the live transcript panel while the hotkey is held (Instant Stream mode only). Recordings stop automatically at 5 minutes.
 
 ### Supported Hotkeys
 * **`cmd_r` (Right Command ⌘ — Default):** Superwhisper standard. Supported on virtually all external and Mac keyboards, comfortable right-thumb push-to-talk, and zero interference with typing accented characters.
