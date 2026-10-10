@@ -16,8 +16,12 @@ if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-v"):
 
 SAMPLE_RATE = 16000
 TITLE_IDLE = f"🎙️ v{__version__}"
-TITLE_RECORDING = f"🔴 v{__version__}"
 TITLE_BUSY = f"⏳ v{__version__}"
+
+
+def recording_title(elapsed):
+  minutes, seconds = divmod(int(elapsed), 60)
+  return f"🔴 {minutes}:{seconds:02d}"
 
 # Fast-path for lightweight audio recording worker (bypasses heavy MLX and Cocoa imports)
 # This enables sub-80ms startup and eliminates external FFmpeg / Santa binary requirements
@@ -365,7 +369,7 @@ class LocalWhisperApp(rumps.App):
     self._apply_hotkey_config()
 
     self.pause_media = bool(self.config.get("pause_media", True))
-    self.show_preview = bool(self.config.get("show_preview", True))
+    self.show_preview = bool(self.config.get("show_preview", False))
     self.overlay = PreviewOverlay()
     # Serialises GPU use between the live preview and the final transcription
     self.whisper_lock = threading.Lock()
@@ -787,7 +791,7 @@ class LocalWhisperApp(rumps.App):
         return
       self.is_recording = True
       self.recording_start_time = time.time()
-      self.title = TITLE_RECORDING
+      self.title = recording_title(0)
       if self.show_preview:
         self.overlay.show("Listening…")
       if self.pause_media:
@@ -1122,6 +1126,10 @@ class LocalWhisperApp(rumps.App):
     while True:
       time.sleep(1)
       now = time.time()
+
+      with self.lock:
+        if self.is_recording and self.recording_start_time:
+          self.title = recording_title(now - self.recording_start_time)
 
       if self.transcription_start_time and (now - self.transcription_start_time > TRANSCRIPTION_HUNG_SECONDS):
         log("WATCHDOG", f"Transcription active for {now - self.transcription_start_time:.1f}s. Resetting status title.")
