@@ -91,12 +91,11 @@ import mlx.core as mx
 import mlx_whisper
 import numpy as np
 import objc
-import pyperclip
 from pynput import keyboard
 import rumps
 from AppKit import (
     NSBackingStoreBuffered, NSColor, NSEvent, NSFont, NSLineBreakByWordWrapping, NSMakeRect, NSPanel,
-    NSScreen, NSStatusWindowLevel, NSTextField, NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSScreen, NSStatusWindowLevel, NSTextField, NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary, NSWindowStyleMaskBorderless,
     NSWindowStyleMaskNonactivatingPanel,
 )
@@ -121,6 +120,10 @@ HOTKEY_CMD_R = "cmd_r"
 HOTKEY_ALT_R = "alt_r"
 
 MAX_RECORDING_SECONDS = 300
+# The target app reads the clipboard asynchronously after Cmd+V; restoring sooner can paste the old contents
+CLIPBOARD_RESTORE_SECONDS = 0.5
+# nspasteboard.org convention: clipboard managers skip items carrying this type
+TRANSIENT_PASTEBOARD_TYPE = "org.nspasteboard.TransientType"
 # A full-length recording takes roughly 20s to transcribe
 TRANSCRIPTION_HUNG_SECONDS = 90
 
@@ -270,6 +273,19 @@ class MediaController:
       self.paused_by_us = False
       self._mediaremote.MRMediaRemoteSendCommand(MR_COMMAND_PLAY, None)
       log("MEDIA", "Resumed media.")
+
+
+def snapshot_clipboard(pasteboard):
+  """Copies every item on the pasteboard, in all of its types, so it can be written back."""
+  items = []
+  for item in pasteboard.pasteboardItems() or []:
+    copy = NSPasteboardItem.alloc().init()
+    for kind in item.types():
+      data = item.dataForType_(kind)
+      if data is not None:
+        copy.setData_forType_(data, kind)
+    items.append(copy)
+  return items
 
 
 class PreviewOverlay:
@@ -1082,10 +1098,8 @@ class LocalWhisperApp(rumps.App):
       rtf = trimmed_duration / max(elapsed, 0.001)
 
       if text:
-        pyperclip.copy(text)
         log("WHISPER", f"Result ({elapsed:.2f}s, {rtf:.1f}x realtime): \"{text}\"")
-        time.sleep(0.08)
-        self._paste()
+        self._paste_preserving_clipboard(text)
       else:
         log("WHISPER", f"No speech detected in audio ({elapsed:.2f}s).")
     finally:
@@ -1095,6 +1109,25 @@ class LocalWhisperApp(rumps.App):
   # ---------------------------------------------------------------------------
   # Auto-Paste Simulation
   # ---------------------------------------------------------------------------
+  def _paste_preserving_clipboard(self, text):
+    pasteboard = NSPasteboard.generalPasteboard()
+    saved = snapshot_clipboard(pasteboard)
+    pasteboard.clearContents()
+    pasteboard.setString_forType_(text, NSPasteboardTypeString)
+    pasteboard.setString_forType_("", TRANSIENT_PASTEBOARD_TYPE)
+    dictation_change = pasteboard.changeCount()
+    try:
+      time.sleep(0.08)
+      self._paste()
+    finally:
+      time.sleep(CLIPBOARD_RESTORE_SECONDS)
+      # A newer copy made by the user wins over the restore
+      if pasteboard.changeCount() == dictation_change:
+        pasteboard.clearContents()
+        if saved:
+          pasteboard.writeObjects_(saved)
+        log("PASTE", f"Restored clipboard ({len(saved)} item(s)).")
+
   def _paste(self):
     # The listener sees these synthetic keys; keep them from reading as a hotkey shortcut
     self.pasting = True

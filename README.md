@@ -14,7 +14,7 @@ A lightweight, 100% on-device voice dictation tool for macOS running on Apple Si
 - **Selectable Audio Capture Modes:**
   - **Instant Stream (Default):** Continuous in-memory audio capture with `0ms` startup latency.
   - **On-Demand (Mic Privacy):** Spawns an internal Python worker only while speaking; macOS orange microphone indicator shuts off completely when idle.
-- **Auto-Paste & Clipboard:** Transcribed text is copied to your system clipboard and automatically pasted directly into whatever application is currently focused (`Cmd + V`).
+- **Auto-Paste, Clipboard Preserved:** Transcribed text is pasted into whatever application is currently focused (`Cmd + V`), then your previous clipboard contents (text, images or files) are put back. Clipboard managers skip the dictated text.
 - **Live Transcript While Holding:** A floating panel near the bottom of the screen shows what you're saying as you speak, refreshed about once a second from the last 30 seconds of audio. It never takes focus, so the paste still lands in your app. Instant Stream mode only; off by default, toggle it from the menu bar.
 - **Recordings up to 5 Minutes:** Longer recordings stop and transcribe automatically.
 - **Live Menu Bar Indicator:** Displays current operational states (`🎙️ v1.1.0` Ready, `🔴 1:23` Recording with elapsed time, `⏳ v1.1.0` Transcribing).
