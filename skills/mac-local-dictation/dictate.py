@@ -95,7 +95,7 @@ from pynput import keyboard
 import rumps
 from AppKit import (
     NSBackingStoreBuffered, NSColor, NSEvent, NSFont, NSLineBreakByWordWrapping, NSMakeRect, NSPanel,
-    NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSScreen, NSStatusWindowLevel, NSTextField, NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSRunningApplication, NSScreen, NSStatusWindowLevel, NSTextField, NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary, NSWindowStyleMaskBorderless,
     NSWindowStyleMaskNonactivatingPanel,
 )
@@ -225,7 +225,7 @@ def default_input_device():
 # ---------------------------------------------------------------------------
 # macOS 15.4+ blocks reading Now Playing state, so "playing" means a media
 # app has audio output open. Browsers hold output open ~10s after a pause.
-MEDIA_BUNDLE_PREFIXES = (
+BROWSER_BUNDLE_PREFIXES = (
     "com.google.Chrome",
     "com.apple.Safari",
     "com.apple.WebKit.GPU",
@@ -233,6 +233,8 @@ MEDIA_BUNDLE_PREFIXES = (
     "company.thebrowser.Browser",
     "com.microsoft.edgemac",
     "com.brave.Browser",
+)
+MEDIA_APP_BUNDLE_PREFIXES = (
     "com.spotify.client",
     "com.apple.Music",
     "com.apple.podcasts",
@@ -240,8 +242,32 @@ MEDIA_BUNDLE_PREFIXES = (
     "org.videolan.vlc",
     "com.colliderli.iina",
 )
+MEDIA_BUNDLE_PREFIXES = BROWSER_BUNDLE_PREFIXES + MEDIA_APP_BUNDLE_PREFIXES
+BROWSER_MEDIA_DOMAINS = (
+    "youtube.com",
+    "music.youtube",
+    "soundcloud.com",
+    "netflix.com",
+    "spotify.com",
+    "twitch.tv",
+    "vimeo.com",
+)
 MR_COMMAND_PLAY = 0
 MR_COMMAND_PAUSE = 1
+
+
+def _browser_has_media_tab():
+  """Checks if a supported browser (e.g. Chrome) has an active media/video tab."""
+  if NSRunningApplication.runningApplicationsWithBundleIdentifier_("com.google.Chrome"):
+    try:
+      script = 'tell application "Google Chrome" to return URL of tabs of windows'
+      res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=0.5)
+      out = res.stdout.lower()
+      if any(d in out for d in BROWSER_MEDIA_DOMAINS):
+        return True
+    except Exception:
+      pass
+  return False
 
 
 class MediaController:
@@ -254,11 +280,19 @@ class MediaController:
 
   def media_playing_apps(self):
     playing = []
+    browser_checked = False
+    browser_active_media = False
     for process_id in coreaudio_property(AUDIO_SYSTEM_OBJECT, "prs#", ctypes.c_uint32):
       if coreaudio_property(process_id, "piro", ctypes.c_uint32)[:1] == [1]:
         bundle_id = coreaudio_string(process_id, "pbid")
-        if bundle_id.startswith(MEDIA_BUNDLE_PREFIXES):
+        if bundle_id.startswith(MEDIA_APP_BUNDLE_PREFIXES):
           playing.append(bundle_id)
+        elif bundle_id.startswith(BROWSER_BUNDLE_PREFIXES):
+          if not browser_checked:
+            browser_active_media = _browser_has_media_tab()
+            browser_checked = True
+          if browser_active_media:
+            playing.append(bundle_id)
     return playing
 
   def pause(self):
@@ -271,8 +305,22 @@ class MediaController:
   def resume(self):
     if self.paused_by_us:
       self.paused_by_us = False
+      was_music_running = bool(NSRunningApplication.runningApplicationsWithBundleIdentifier_("com.apple.Music"))
       self._mediaremote.MRMediaRemoteSendCommand(MR_COMMAND_PLAY, None)
+      if not was_music_running:
+        threading.Thread(target=self._suppress_unwanted_music, daemon=True).start()
       log("MEDIA", "Resumed media.")
+
+  def _suppress_unwanted_music(self):
+    for _ in range(10):
+      time.sleep(0.1)
+      apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_("com.apple.Music")
+      if apps:
+        for app in apps:
+          app.terminate()
+        subprocess.run(["killall", "Music"], capture_output=True)
+        log("MEDIA", "Suppressed unwanted Apple Music launch.")
+        break
 
 
 def snapshot_clipboard(pasteboard):
