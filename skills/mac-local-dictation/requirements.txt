@@ -1,7 +1,7 @@
-mlx-whisper>=0.4.0
-sounddevice>=0.4.6
-numpy>=1.24.0
-scipy>=1.10.0
+mlx-whisper>=0.4.3
+sounddevice>=0.5.6
+numpy>=2.5.4
+scipy>=1.18.1
 rumps>=0.4.0
-pynput>=1.7.6
-pyobjc-core>=10.0
+pynput>=1.8.2
+pyobjc-core>=12.2.2
